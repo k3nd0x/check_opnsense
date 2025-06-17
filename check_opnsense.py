@@ -314,6 +314,8 @@ class CheckOPNsense:
         url = self.get_url("core/hasync/get")
         data = self.request(url)
 
+        self.check_message += "I am sorry this check type is not implemented yet :("
+
     def check_interfaces(self) -> None:
         url = self.get_url("interfaces/overview/interfaces_info")
         data = self.request(url)
