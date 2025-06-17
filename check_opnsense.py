@@ -155,14 +155,15 @@ class CheckOPNsense:
             self.check_services()
         elif self.options.mode == "wireguard":
             self.check_wireguard()
+        elif self.options.mode == "memory":
+            self.check_memory()
+        elif self.options.mode == "systeminfo":
+            self.check_sysinfo()
+        elif self.options.mode == "systemdisk":
+            self.check_systemdisk()
         else:
             message = f"Check mode '{self.options.mode}' not known"
             self.output(CheckState.UNKNOWN, message)
-
-        if self.options.filter:
-            self.options.filter = self.options.filter.split(",")
-        else:
-            self.options.filter = []
 
         self.check_output()
 
@@ -213,7 +214,10 @@ class CheckOPNsense:
                 "hastatus",
                 "interfaces",
                 "services",
-                "wireguard"
+                "wireguard",
+                "memory",
+                "systeminfo",
+                "systemdisk"
             ),
             required=True,
             help="Mode to use.",
@@ -223,6 +227,7 @@ class CheckOPNsense:
             "--warning",
             dest="treshold_warning",
             type=float,
+            default=90.0,
             help="Warning treshold for check value",
         )
         check_opts.add_argument(
@@ -230,6 +235,7 @@ class CheckOPNsense:
             "--critical",
             dest="treshold_critical",
             type=float,
+            default=95.0,
             help="Critical treshold for check value",
         )
         check_opts.add_argument(
@@ -250,6 +256,9 @@ class CheckOPNsense:
 
 
         options = p.parse_args()
+
+        if options.filter:
+            self.filterlist += options.filter.split(",")
 
         self.options = options
 
@@ -328,7 +337,7 @@ class CheckOPNsense:
             device = row.get("device", None)
             enabled = row.get("enabled", False)
             status = row.get("status", "Down")
-            if device not in self.options.filter:
+            if device not in self.filterlist:
                 if enabled:
                     if status == "up":
                         self.check_result = CheckState.OK
@@ -373,7 +382,7 @@ class CheckOPNsense:
         disabled_services = []
         filtered_services = []
         for i in list_of_services:
-            if i not in self.options.filter:
+            if i not in self.filterlist:
                 url = self.get_url(f"{i}/service/status")
                 data = self.request(url)
 
@@ -421,7 +430,7 @@ class CheckOPNsense:
             name = wgs.get("name", "unknown")
             endpoint = wgs.get("endpoint","unknown")
 
-            if name not in self.options.filter:
+            if name not in self.filterlist:
                 if peer_status == "online":
                     online.append(f"[OK] Peer {name} is online ({endpoint})" )
                 else:
@@ -450,11 +459,101 @@ class CheckOPNsense:
             for i in filtered:
                 self.check_message += f"[FILTER] Peer {i} is filtered by --filter\n"
 
+    def check_sysinfo(self) -> None:
+        url = self.get_url(f"diagnostics/system/system_information")
+        data = self.request(url)
+
+        self.check_message += data["name"] + "\n"
+        self.check_message += "\n".join(data["versions"])
+
+
+    def check_memory(self) -> None:
+        url = self.get_url(f"diagnostics/system/system_resources")
+        data = self.request(url)
+
+        memory = data.get("memory", {})
+
+        if memory:
+            used_b = float(memory.get("used",0))
+            total_b = float(memory.get("total",0))
+            free_b = total_b - used_b
+
+            used_mb = float(memory.get("used_frmt",0))
+            total_mb = float(memory.get("total_frmt",0))
+            free_mb = total_mb - used_mb
+
+            used_p = round(( used_b / total_b ) * 100,2)
+            free_p = round(( free_b / total_b ) * 100,2)
+
+            if used_p >= self.options.treshold_critical:
+                self.check_result = CheckState.CRITICAL
+
+            elif used_p >= self.options.treshold_warning:
+                self.check_result = CheckState.WARNING
+
+            else:
+                self.check_result = CheckState.OK
+            self.check_message += f"Memory Used: {used_mb}MB ({used_p}%) - Free {free_mb}MB ({free_p}%) - Total: {total_mb}MB (100%)"
+
+            self.perfdata.append(f"memory={used_p}%;{self.options.treshold_warning};{self.options.treshold_critical};0.0;100.0")
+
+    def check_systemdisk(self) -> None:
+        url = self.get_url(f"diagnostics/system/system_disk")
+        data = self.request(url)
+
+        devices = data.get("devices", [])
+
+        critical = []
+        warning = []
+        ok = []
+        if devices:
+            for i in devices:
+                mountpoint = i.get("mountpoint")
+
+                if mountpoint not in self.filterlist:
+                    used_p = i.get('used_pct', 100)
+                    available = i.get('available')
+                    used = i.get('used')
+
+                    if used_p >= self.options.treshold_critical:
+                        critical.append(f"[CRITICAL] Mountpoint {mountpoint} is {used_p}% full - {used}/{available}")
+                    elif used_p >= self.options.treshold_warning:
+                        warning.append(f"[WARNING] Mountpoint {mountpoint} is {used_p}% full - {used}/{available}")
+                    else:
+                        ok.append(f"[OK] Mountpoint {mountpoint} is {used_p}% full - {used}/{available}")
+
+                    self.perfdata.append(f"disk_{mountpoint}%;{self.options.treshold_warning};{self.options.treshold_critical};0.0;100.0")
+
+            counter_ok = len(ok)
+            counter_warn = len(warning)
+            counter_crit = len(critical)
+
+            counter_sum = counter_ok + counter_warn + counter_crit
+
+            if critical:
+                self.check_message = f"{counter_crit}/{counter_sum} Mountpoints are critical full\n"
+                self.check_result = CheckState.CRITICAL
+            elif warning:
+                self.check_message = f"{counter_warn}/{counter_sum} Mountpoints are in warning state\n"
+                self.check_result = CheckState.WARNING
+            else:
+                self.check_message = f"{counter_ok}/{counter_sum} Mountpoints are ok\n"
+                self.check_result = CheckState.OK
+
+            for i in critical:
+                self.check_message += f"{i}\n"
+            for i in warning:
+                self.check_message += f"{i}\n"
+            for i in ok:
+                self.check_message += f"{i}\n"
+
+
     def __init__(self) -> None:
         self.options = {}
         self.perfdata = []
         self.check_result = CheckState.UNKNOWN
         self.check_message = ""
+        self.filterlist = []
 
         self.parse_args()
 
